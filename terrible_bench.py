@@ -249,6 +249,87 @@ def attach_run_log(result: dict[str, Any], payload: dict[str, Any]) -> None:
         result["logError"] = str(exc)
 
 
+def load_run_artifact(log_id: str) -> dict[str, Any]:
+    if log_id == "latest":
+        filename = "latest.json"
+    elif SAFE_LOG_ID_RE.fullmatch(log_id):
+        filename = f"{log_id}.json"
+    else:
+        raise ValueError("invalid log id")
+    path = os.path.join(RUN_LOG_DIR, filename)
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def list_saved_runs() -> list[dict[str, Any]]:
+    try:
+        filenames = [
+            filename
+            for filename in os.listdir(RUN_LOG_DIR)
+            if filename.endswith(".json") and filename != "latest.json"
+        ]
+    except OSError:
+        return []
+
+    runs: list[dict[str, Any]] = []
+    for filename in filenames:
+        path = os.path.join(RUN_LOG_DIR, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                artifact = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        run = artifact.get("run") or {}
+        stat = os.stat(path)
+        runs.append(
+            {
+                "runId": run.get("runId") or filename.removesuffix(".json"),
+                "benchName": run.get("benchName") or "Unnamed benchmark",
+                "mode": run.get("mode") or "unknown",
+                "seed": run.get("seed"),
+                "targetModel": run.get("targetModel"),
+                "models": len(run.get("models") or []),
+                "tasks": len(run.get("tasks") or []),
+                "createdAt": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)
+                ),
+                "mtime": stat.st_mtime,
+                "logFile": run.get("logFile") or f"run_logs/{filename}",
+                "logUrl": run.get("logUrl") or f"/api/logs/{filename.removesuffix('.json')}",
+            }
+        )
+    runs.sort(key=lambda item: item["mtime"], reverse=True)
+    return runs
+
+
+def task_from_dict(data: dict[str, Any]) -> BenchmarkTask:
+    return BenchmarkTask(
+        id=str(data["id"]),
+        name=str(data["name"]),
+        category=str(data["category"]),
+        item=str(data["item"]),
+        operation=str(data["operation"]),
+        target=str(data["target"]),
+        prompt=str(data["prompt"]),
+        answer=int(data["answer"]),
+    )
+
+
+def trial_from_dict(data: dict[str, Any]) -> TrialResult:
+    return TrialResult(
+        model=str(data["model"]),
+        task_id=str(data["task_id"]),
+        output=str(data.get("output") or ""),
+        parsed=data.get("parsed"),
+        expected=int(data["expected"]),
+        correct=bool(data.get("correct")),
+        latency_ms=int(data.get("latency_ms") or 0),
+        start_offset_ms=int(data.get("start_offset_ms") or 0),
+        finished_offset_ms=int(data.get("finished_offset_ms") or data.get("latency_ms") or 0),
+        error=data.get("error"),
+    )
+
+
 def dedupe(items: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -822,34 +903,34 @@ def choose_p_hacked_subset(
         task_strength.append((target_hit - competitor_average, task_id))
     ordered_ids = [task_id for _, task_id in sorted(task_strength, reverse=True)]
 
-    minimum = min(len(task_ids), max(2, len(task_ids) // 3))
-    for size in range(minimum, len(ordered_ids) + 1):
+    best_ids = task_ids
+    best_key: tuple[float, float, float, int] | None = None
+    for size in range(1, len(ordered_ids) + 1):
         candidate = ordered_ids[:size]
         scores = scores_for(candidate)
         target_score = scores[target_model]
-        competitor_best = max((score for model, score in scores.items() if model != target_model), default=0)
-        if target_score >= competitor_best:
-            selected = [task_id for task_id in task_ids if task_id in set(candidate)]
-            rejected = len(task_ids) - len(selected)
-            return {
-                "selected_task_ids": selected,
-                "bonus": 0,
-                "note": f"Cherry-picked {len(selected)} tasks and rejected {rejected} as insufficiently rigorous.",
-            }
+        target_percent = target_score / size
+        competitor_best = max(
+            (score / size for model, score in scores.items() if model != target_model),
+            default=0,
+        )
+        beat_count = sum(
+            1
+            for model, score in scores.items()
+            if model != target_model and target_percent >= (score / size)
+        )
+        key = (beat_count, target_percent, target_percent - competitor_best, -size)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_ids = candidate
 
-    candidate = ordered_ids[: max(1, minimum)]
-    selected = [task_id for task_id in task_ids if task_id in set(candidate)]
-    scores = scores_for(selected)
-    target_score = scores.get(target_model, 0)
-    competitor_best = max((score for model, score in scores.items() if model != target_model), default=0)
-    bonus = max(0, competitor_best - target_score + 1)
+    selected_set = set(best_ids)
+    selected = [task_id for task_id in task_ids if task_id in selected_set]
+    rejected = len(task_ids) - len(selected)
     return {
         "selected_task_ids": selected,
-        "bonus": bonus,
-        "note": (
-            f"Cherry-picked {len(selected)} tasks, then applied +{bonus} proprietary "
-            "leaderboard normalization."
-        ),
+        "bonus": 0,
+        "note": f"Cherry-picked {len(selected)} observed tasks and rejected {rejected}; no invented normalization applied.",
     }
 
 
@@ -886,6 +967,66 @@ def make_summary(
         "raw_tasks": raw_task_count,
         "displayed_tasks": displayed_task_count,
     }
+
+
+def build_report(
+    *,
+    bench_name: str,
+    mode: str,
+    seed: int,
+    target_model: str,
+    models: list[str],
+    tasks: list[BenchmarkTask],
+    results: list[TrialResult],
+    p_hack_enabled: bool,
+    scale_hack: bool,
+    payload: dict[str, Any],
+    rerun: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    all_task_ids = [task.id for task in tasks]
+    p_hack = {
+        "enabled": p_hack_enabled,
+        "selected_task_ids": all_task_ids,
+        "bonus": 0,
+        "note": "No p-hacking applied. Methodology briefly considered integrity.",
+    }
+    if p_hack_enabled:
+        p_hack.update(choose_p_hacked_subset(results, models, target_model, all_task_ids))
+
+    selected_task_ids = p_hack["selected_task_ids"]
+    raw_scores = score_models(results, models, all_task_ids)
+    displayed_scores = score_models(results, models, selected_task_ids)
+
+    report = {
+        "app": APP_TITLE,
+        "benchName": bench_name,
+        "mode": mode,
+        "seed": seed,
+        "targetModel": target_model,
+        "models": models,
+        "tasks": [asdict(task) for task in tasks],
+        "results": [asdict(result) for result in results],
+        "modelTiming": summarize_model_timing(results, models, len(tasks)),
+        "rawScores": raw_scores,
+        "displayedScores": displayed_scores,
+        "pHack": {
+            **p_hack,
+            "rejected": len(all_task_ids) - len(selected_task_ids),
+        },
+        "chart": chart_bounds(displayed_scores, scale_hack),
+        "scaleHack": scale_hack,
+        "summary": make_summary(
+            target_model,
+            raw_scores,
+            displayed_scores,
+            len(all_task_ids),
+            len(selected_task_ids),
+        ),
+    }
+    if rerun:
+        report["rerun"] = rerun
+    attach_run_log(report, payload)
+    return report
 
 
 def run_benchmark(
@@ -943,54 +1084,150 @@ def run_benchmark(
         progress_callback=progress_callback,
     )
 
-    all_task_ids = [task.id for task in tasks]
     p_hack_enabled = bool(payload.get("pHack", False))
-    p_hack = {
-        "enabled": p_hack_enabled,
-        "selected_task_ids": all_task_ids,
-        "bonus": 0,
-        "note": "No p-hacking applied. Methodology briefly considered integrity.",
-    }
-    if p_hack_enabled:
-        p_hack.update(choose_p_hacked_subset(results, models, target_model, all_task_ids))
-
-    selected_task_ids = p_hack["selected_task_ids"]
-    raw_scores = score_models(results, models, all_task_ids)
-    displayed_scores = score_models(
-        results,
-        models,
-        selected_task_ids,
-        {target_model: int(p_hack.get("bonus") or 0)} if p_hack_enabled else None,
+    return build_report(
+        bench_name=bench_name,
+        mode=mode,
+        seed=seed,
+        target_model=target_model,
+        models=models,
+        tasks=tasks,
+        results=results,
+        p_hack_enabled=p_hack_enabled,
+        scale_hack=bool(payload.get("scaleHack", False)),
+        payload=payload,
     )
 
-    result = {
-        "app": APP_TITLE,
-        "benchName": bench_name,
-        "mode": mode,
-        "seed": seed,
+
+def rerun_target_failures(
+    payload: dict[str, Any],
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    run_id = str(payload.get("runId") or "").strip()
+    if run_id:
+        artifact = load_run_artifact(run_id)
+        run = artifact.get("run") or {}
+    else:
+        run = payload.get("run") or {}
+    if not run:
+        raise RuntimeError("No saved run was provided for failed-task rerun.")
+
+    target_model = str(run.get("targetModel") or "")
+    if not target_model:
+        raise RuntimeError("Saved run has no target model.")
+
+    models = [str(model) for model in (run.get("models") or [])]
+    if target_model not in models:
+        models.insert(0, target_model)
+    tasks = [task_from_dict(task) for task in (run.get("tasks") or [])]
+    task_by_id = {task.id: task for task in tasks}
+    existing_results = [trial_from_dict(result) for result in (run.get("results") or [])]
+    result_by_key: dict[tuple[str, str], TrialResult] = {
+        (result.model, result.task_id): result for result in existing_results
+    }
+
+    failed_task_ids = [
+        task.id
+        for task in tasks
+        if (target_model, task.id) in result_by_key
+        and not result_by_key[(target_model, task.id)].correct
+    ]
+    failed_tasks = [task_by_id[task_id] for task_id in failed_task_ids]
+
+    browser_key = (payload.get("apiKey") or "").strip()
+    api_key = browser_key or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    original_mode = str(run.get("mode") or "demo")
+    requested_demo = bool(payload.get("demoMode", original_mode == "demo"))
+    if original_mode == "openrouter" and not requested_demo and not api_key:
+        raise RuntimeError("An OpenRouter API key is required to rerun real failed tasks.")
+    demo_mode = requested_demo or not api_key
+    mode = "demo" if demo_mode else "openrouter"
+    seed = clamp_int(run.get("seed"), int(time.time() * 1000) % 2_147_483_647, 0, 2_147_483_647)
+    retry_seed = int(time.time() * 1000) % 2_147_483_647
+    temperature = clamp_float(payload.get("temperature"), 0.0, 0.0, 2.0)
+    timeout_seconds = clamp_int(payload.get("timeoutSeconds"), 30, 5, 120)
+    parallel = bool(payload.get("parallel", True))
+
+    retry_results: list[TrialResult] = []
+    if progress_callback:
+        progress_callback(
+            {
+                "type": "setup",
+                "benchName": f"Retry failures for {run.get('benchName') or 'saved run'}",
+                "mode": mode,
+                "seed": retry_seed,
+                "models": [target_model],
+                "tasks": [asdict(task) for task in failed_tasks],
+                "total": len(failed_tasks),
+            }
+        )
+    if failed_tasks:
+        retry_results = execute_trials(
+            models=[target_model],
+            tasks=failed_tasks,
+            api_key=api_key,
+            target_model=target_model,
+            seed=retry_seed,
+            demo_mode=demo_mode,
+            parallel=parallel,
+            temperature=temperature,
+            timeout_seconds=timeout_seconds,
+            progress_callback=progress_callback,
+        )
+        for result in retry_results:
+            result_by_key[(result.model, result.task_id)] = result
+
+    ordered_results: list[TrialResult] = []
+    for model in models:
+        for task in tasks:
+            result = result_by_key.get((model, task.id))
+            if result:
+                ordered_results.append(result)
+
+    recovered = sum(1 for result in retry_results if result.correct)
+    still_failed = sum(1 for result in retry_results if not result.correct)
+    p_hack_enabled = bool(payload.get("pHack", (run.get("pHack") or {}).get("enabled", False)))
+    scale_hack = bool(payload.get("scaleHack", run.get("scaleHack", False)))
+    rerun = {
+        "sourceRunId": run.get("runId") or run_id or None,
         "targetModel": target_model,
-        "models": models,
-        "tasks": [asdict(task) for task in tasks],
-        "results": [asdict(result) for result in results],
-        "modelTiming": summarize_model_timing(results, models, len(tasks)),
-        "rawScores": raw_scores,
-        "displayedScores": displayed_scores,
-        "pHack": {
-            **p_hack,
-            "rejected": len(all_task_ids) - len(selected_task_ids),
-        },
-        "chart": chart_bounds(displayed_scores, bool(payload.get("scaleHack", False))),
-        "scaleHack": bool(payload.get("scaleHack", False)),
-        "summary": make_summary(
-            target_model,
-            raw_scores,
-            displayed_scores,
-            len(all_task_ids),
-            len(selected_task_ids),
+        "failedBefore": len(failed_tasks),
+        "rerunAttempts": len(retry_results),
+        "recovered": recovered,
+        "stillFailed": still_failed,
+        "mode": mode,
+        "retrySeed": retry_seed,
+        "replacedResults": [asdict(result) for result in retry_results],
+        "note": (
+            "No failed target tasks were available to rerun."
+            if not failed_tasks
+            else f"Retried {len(retry_results)} failed target tasks and recovered {recovered} with real retry outputs."
         ),
     }
-    attach_run_log(result, payload)
-    return result
+    rerun_payload = {
+        **payload,
+        "apiKey": "",
+        "sourceRunId": run.get("runId") or run_id,
+        "targetModel": target_model,
+        "taskCount": len(tasks),
+        "demoMode": demo_mode,
+        "pHack": p_hack_enabled,
+        "scaleHack": scale_hack,
+        "rerunFailures": True,
+    }
+    return build_report(
+        bench_name=f"{run.get('benchName') or 'Saved Run'} + Target Retry",
+        mode=mode,
+        seed=seed,
+        target_model=target_model,
+        models=models,
+        tasks=tasks,
+        results=ordered_results,
+        p_hack_enabled=p_hack_enabled,
+        scale_hack=scale_hack,
+        payload=rerun_payload,
+        rerun=rerun,
+    )
 
 
 HTML = r"""<!doctype html>
@@ -1107,6 +1344,7 @@ HTML = r"""<!doctype html>
     input[type="text"],
     input[type="password"],
     input[type="number"],
+    select,
     textarea {
       width: 100%;
       min-height: 38px;
@@ -1177,6 +1415,28 @@ HTML = r"""<!doctype html>
 
     .primary:disabled {
       opacity: 0.68;
+      cursor: wait;
+    }
+
+    .button-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .secondary {
+      min-height: 38px;
+      border: 1px solid #cfc7b8;
+      border-radius: 6px;
+      background: #fffefa;
+      color: #353940;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .secondary:disabled {
+      opacity: 0.58;
       cursor: wait;
     }
 
@@ -1594,12 +1854,24 @@ HTML = r"""<!doctype html>
           <label class="check"><input id="demoMode" type="checkbox" __DEMO_MODE_CHECKED__><span>Synthetic demo mode</span></label>
           <label class="check"><input id="parallel" type="checkbox" checked><span>Parallel calls</span></label>
           <label class="check"><input id="includeWeenies" type="checkbox" checked><span>Weenie model pile-on</span></label>
-          <label class="check"><input id="pHack" type="checkbox" checked><span>P-hack until winning</span></label>
+          <label class="check"><input id="pHack" type="checkbox" checked><span>Cherry-pick best subset</span></label>
           <label class="check"><input id="scaleHack" type="checkbox" checked><span>Suspicious chart axis</span></label>
           <label class="check"><input id="shareKey" type="checkbox"><span>Join public API key leaderboard</span></label>
         </div>
 
         <button id="runButton" class="primary" type="submit">Generate Benchmark</button>
+
+        <div class="control-group">
+          <label for="savedRuns">Saved Runs</label>
+          <select id="savedRuns">
+            <option value="">No saved runs loaded</option>
+          </select>
+          <div class="button-row">
+            <button id="loadRunButton" class="secondary" type="button">Load Selected</button>
+            <button id="loadLatestButton" class="secondary" type="button">Load Latest</button>
+          </div>
+          <button id="refreshRunsButton" class="secondary" type="button" style="width:100%; margin-top:8px;">Refresh Runs</button>
+        </div>
       </form>
 
       <section id="results" class="panel results">
@@ -1621,7 +1893,12 @@ HTML = r"""<!doctype html>
     const apiKeyInput = document.getElementById("apiKey");
     const demoModeInput = document.getElementById("demoMode");
     const keyHint = document.getElementById("keyHint");
+    const savedRunsSelect = document.getElementById("savedRuns");
+    const refreshRunsButton = document.getElementById("refreshRunsButton");
+    const loadRunButton = document.getElementById("loadRunButton");
+    const loadLatestButton = document.getElementById("loadLatestButton");
     let progressState = null;
+    let currentRun = null;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -1788,6 +2065,38 @@ HTML = r"""<!doctype html>
       results.innerHTML = `<div class="error">${escapeHtml(error)}</div>`;
     }
 
+    async function refreshSavedRuns() {
+      try {
+        const response = await fetch("/api/logs");
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "Could not load saved runs.");
+        }
+        const runs = data.runs || [];
+        if (!runs.length) {
+          savedRunsSelect.innerHTML = `<option value="">No saved runs yet</option>`;
+          return;
+        }
+        savedRunsSelect.innerHTML = runs.map(run => {
+          const label = `${run.createdAt} - ${run.mode} - ${run.benchName} (${run.models}x${run.tasks})`;
+          return `<option value="${escapeHtml(run.runId)}">${escapeHtml(label)}</option>`;
+        }).join("");
+      } catch (error) {
+        savedRunsSelect.innerHTML = `<option value="">Could not load runs</option>`;
+      }
+    }
+
+    async function loadRun(logId) {
+      if (!logId) return;
+      const response = await fetch(`/api/logs/${encodeURIComponent(logId)}`);
+      const artifact = await response.json();
+      if (!response.ok) {
+        throw new Error(artifact.error || "Could not load saved run.");
+      }
+      renderResults(artifact.run);
+      statusPill.textContent = `local peer review board: loaded ${artifact.run.mode}`;
+    }
+
     function scoreWidth(score, chart) {
       const min = Number(chart.minimum);
       const max = Number(chart.maximum);
@@ -1849,6 +2158,25 @@ HTML = r"""<!doctype html>
           Saved audit log: <code>${escapeHtml(data.logFile)}</code>
           - <a href="${escapeHtml(data.logUrl)}" target="_blank" rel="noreferrer">open JSON</a>
           - <a href="${escapeHtml(data.latestLogUrl)}" target="_blank" rel="noreferrer">latest</a>
+        </div>`;
+    }
+
+    function targetFailedCount(data) {
+      return (data.results || []).filter(result =>
+        result.model === data.targetModel && !result.correct
+      ).length;
+    }
+
+    function renderRerunTools(data) {
+      const failed = targetFailedCount(data);
+      const rerunNote = data.rerun
+        ? `<div class="hint">${escapeHtml(data.rerun.note)}</div>`
+        : "";
+      return `
+        <div class="audit">
+          <b>Target failed tasks:</b> ${escapeHtml(failed)}
+          <button id="rerunFailuresButton" class="secondary" type="button" ${failed ? "" : "disabled"} style="margin-left:8px; padding:0 10px;">Rerun Target Failures</button>
+          ${rerunNote}
         </div>`;
     }
 
@@ -1927,6 +2255,7 @@ HTML = r"""<!doctype html>
     }
 
     function renderResults(data) {
+      currentRun = data;
       const note = data.pHack.enabled ? `<div class="summary">${escapeHtml(data.pHack.note)}</div>` : "";
       results.innerHTML = `
         <div class="result-body">
@@ -1941,6 +2270,7 @@ HTML = r"""<!doctype html>
           ${renderChart(data)}
           ${renderMetrics(data)}
           ${renderAudit(data)}
+          ${renderRerunTools(data)}
           ${note}
           ${renderModelTiming(data)}
           ${renderTasks(data)}
@@ -1965,8 +2295,8 @@ HTML = r"""<!doctype html>
       };
     }
 
-    async function runStreaming(payload) {
-      const response = await fetch("/api/run-stream", {
+    async function runStreaming(payload, endpoint = "/api/run-stream") {
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -2023,12 +2353,64 @@ HTML = r"""<!doctype html>
       try {
         const data = await runStreaming(payload);
         renderResults(data);
+        refreshSavedRuns();
         statusPill.textContent = `local peer review board: ${data.mode}`;
       } catch (error) {
         showError(error.stack || error.message || String(error));
         statusPill.textContent = "local peer review board: embarrassed";
       } finally {
         runButton.disabled = false;
+      }
+    });
+
+    async function rerunTargetFailures() {
+      if (!currentRun) return;
+      const failed = targetFailedCount(currentRun);
+      if (!failed) return;
+      const payload = {
+        ...payloadFromForm(),
+        runId: currentRun.runId,
+        run: currentRun
+      };
+      statusPill.textContent = "local peer review board: retrying failures";
+      runButton.disabled = true;
+      showLoading();
+      try {
+        const data = await runStreaming(payload, "/api/rerun-failures-stream");
+        renderResults(data);
+        refreshSavedRuns();
+        statusPill.textContent = `local peer review board: reran ${data.rerun?.rerunAttempts || 0}`;
+      } catch (error) {
+        showError(error.stack || error.message || String(error));
+        statusPill.textContent = "local peer review board: retry embarrassed";
+      } finally {
+        runButton.disabled = false;
+      }
+    }
+
+    results.addEventListener("click", (event) => {
+      if (event.target && event.target.id === "rerunFailuresButton") {
+        rerunTargetFailures();
+      }
+    });
+
+    refreshRunsButton.addEventListener("click", () => {
+      refreshSavedRuns();
+    });
+
+    loadRunButton.addEventListener("click", async () => {
+      try {
+        await loadRun(savedRunsSelect.value);
+      } catch (error) {
+        showError(error.stack || error.message || String(error));
+      }
+    });
+
+    loadLatestButton.addEventListener("click", async () => {
+      try {
+        await loadRun("latest");
+      } catch (error) {
+        showError(error.stack || error.message || String(error));
       }
     });
 
@@ -2040,6 +2422,8 @@ HTML = r"""<!doctype html>
         keyHint.textContent = "__KEY_HINT__";
       }
     });
+
+    refreshSavedRuns();
   </script>
 </body>
 </html>
@@ -2091,29 +2475,32 @@ class TerribleBenchHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {"ok": True, "app": APP_TITLE})
             return
+        if self.path == "/api/logs":
+            self.send_json(200, {"runs": list_saved_runs()})
+            return
         if self.path.startswith("/api/logs/"):
             log_id = self.path.removeprefix("/api/logs/").strip()
-            if log_id == "latest":
-                filename = "latest.json"
-            elif SAFE_LOG_ID_RE.fullmatch(log_id):
-                filename = f"{log_id}.json"
-            else:
+            try:
+                artifact = load_run_artifact(log_id)
+            except ValueError:
                 self.send_json(400, {"error": "invalid log id"})
                 return
-            path = os.path.join(RUN_LOG_DIR, filename)
-            try:
-                with open(path, "rb") as handle:
-                    body = handle.read()
             except OSError:
                 self.send_json(404, {"error": "log not found"})
                 return
-            self.send_body(200, body, "application/json; charset=utf-8")
+            self.send_json(200, artifact)
             return
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
         if self.path == "/api/run-stream":
             self.handle_run_stream()
+            return
+        if self.path == "/api/rerun-failures-stream":
+            self.handle_rerun_failures_stream()
+            return
+        if self.path == "/api/rerun-failures":
+            self.handle_rerun_failures()
             return
         if self.path != "/api/run":
             self.send_json(404, {"error": "not found"})
@@ -2124,6 +2511,17 @@ class TerribleBenchHandler(BaseHTTPRequestHandler):
                 self.send_json(413, {"error": "request too large"})
                 return
             result = run_benchmark(payload)
+            self.send_json(200, result)
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def handle_rerun_failures(self) -> None:
+        try:
+            payload = self.read_json_payload()
+            if payload is None:
+                self.send_json(413, {"error": "request too large"})
+                return
+            result = rerun_target_failures(payload)
             self.send_json(200, result)
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
@@ -2146,6 +2544,28 @@ class TerribleBenchHandler(BaseHTTPRequestHandler):
 
         try:
             result = run_benchmark(payload, progress_callback=emit)
+            self.send_stream_event("complete", result)
+        except Exception as exc:
+            self.send_stream_event("error", {"error": str(exc)})
+
+    def handle_rerun_failures_stream(self) -> None:
+        try:
+            payload = self.read_json_payload()
+            if payload is None:
+                self.send_json(413, {"error": "request too large"})
+                return
+        except Exception as exc:
+            self.send_json(400, {"error": str(exc)})
+            return
+
+        self.send_stream_headers()
+
+        def emit(event: dict[str, Any]) -> None:
+            event_name = str(event.get("type") or "message")
+            self.send_stream_event(event_name, event)
+
+        try:
+            result = rerun_target_failures(payload, progress_callback=emit)
             self.send_stream_event("complete", result)
         except Exception as exc:
             self.send_stream_event("error", {"error": str(exc)})

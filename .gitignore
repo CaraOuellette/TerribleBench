@@ -3,3 +3,5 @@ __pycache__/
 server.*.log
 .env
 run_logs/
+test_run_logs/
+tmp*/

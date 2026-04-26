@@ -34,8 +34,9 @@ python -m unittest -v
 - Parses `final answer: <integer>`.
 - Produces a leaderboard.
 - Reports per-model timing, including batch wall time, total API time, average task time, and slowest task.
-- Optionally rejects inconvenient tasks and zooms the chart axis until the desired conclusion emerges.
+- Reloads saved run logs so you can inspect old results without rerunning model calls.
+- Optionally cherry-picks the best observed task subset, reruns the target model's failed tasks, and zooms the chart axis until the desired conclusion emerges.
 
 ## Auditing Runs
 
-Every run writes a JSON audit log under `run_logs/`. The UI links the current run and `/api/logs/latest`. Logs include generated tasks, prompts, expected answers, raw model outputs, parsed answers, model timing, unmodified `rawScores`, and knob-affected `displayedScores`. API keys are not logged.
+Every run writes a JSON audit log under `run_logs/`. The UI links the current run and `/api/logs/latest`, and the saved-runs picker loads old logs back into the report view. Logs include generated tasks, prompts, expected answers, raw model outputs, parsed answers, model timing, unmodified `rawScores`, and knob-affected `displayedScores`. API keys are not logged.
