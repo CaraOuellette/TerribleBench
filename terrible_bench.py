@@ -1087,11 +1087,7 @@ def choose_p_hacked_subset(
     task_ids: list[str],
 ) -> dict[str, Any]:
     if target_model not in models or not task_ids:
-        return {
-            "selected_task_ids": task_ids,
-            "bonus": 0,
-            "note": "P-hack failed because the target model was not in the table.",
-        }
+        return {"selected_task_ids": task_ids, "bonus": 0, "note": "Failed."}
 
     result_lookup = {(result.model, result.task_id): result for result in results}
     competitors = [model for model in models if model != target_model]
@@ -1100,48 +1096,40 @@ def choose_p_hacked_subset(
         result = result_lookup.get((model, task_id))
         return int(bool(result and result.correct))
 
-    def scores_for(ids: list[str]) -> dict[str, int]:
-        return {model: sum(correct(model, task_id) for task_id in ids) for model in models}
+    # Calculate "Strength": Target success minus average competitor success
+    task_scores = []
+    for t_id in task_ids:
+        t_hit = correct(target_model, t_id)
+        comp_avg = sum(correct(m, t_id) for m in competitors) / max(1, len(competitors))
+        task_scores.append({"id": t_id, "strength": t_hit - comp_avg})
 
-    task_strength: list[tuple[float, str]] = []
-    for task_id in task_ids:
-        target_hit = correct(target_model, task_id)
-        competitor_average = (
-            sum(correct(model, task_id) for model in competitors) / max(1, len(competitors))
-        )
-        task_strength.append((target_hit - competitor_average, task_id))
-    ordered_ids = [task_id for _, task_id in sorted(task_strength, reverse=True)]
+    # Sort tasks so the "worst" for our target model are at the end
+    # We want to remove the ones with the lowest strength first
+    sorted_tasks = sorted(task_scores, key=lambda x: x['strength'])
 
-    best_ids = task_ids
-    best_key: tuple[float, float, float, int] | None = None
-    for size in range(1, len(ordered_ids) + 1):
-        candidate = ordered_ids[:size]
-        scores = scores_for(candidate)
-        target_score = scores[target_model]
-        target_percent = target_score / size
-        competitor_best = max(
-            (score / size for model, score in scores.items() if model != target_model),
-            default=0,
-        )
-        beat_count = sum(
-            1
-            for model, score in scores.items()
-            if model != target_model and target_percent >= (score / size)
-        )
-        key = (beat_count, target_percent, target_percent - competitor_best, -size)
-        if best_key is None or key > best_key:
-            best_key = key
-            best_ids = candidate
+    current_ids = set(task_ids)
+    
+    def is_winning(ids_set):
+        if not ids_set: return False
+        scores = {m: sum(correct(m, t) for t in ids_set) for m in models}
+        target_s = scores[target_model]
+        # Victory condition: Target is >= the best competitor
+        return target_s >= max(scores[m] for m in competitors)
 
-    selected_set = set(best_ids)
-    selected = [task_id for task_id in task_ids if task_id in selected_set]
+    # The "Minimal Removal" Loop:
+    # Keep removing the absolute worst tasks until the target model is winning.
+    for task in sorted_tasks:
+        if is_winning(current_ids):
+            break
+        current_ids.remove(task['id'])
+
+    selected = [t for t in task_ids if t in current_ids]
     rejected = len(task_ids) - len(selected)
+    
     return {
         "selected_task_ids": selected,
-        "bonus": 0,
-        "note": f"Cherry-picked {len(selected)} observed tasks and rejected {rejected}; no invented normalization applied.",
+        "note": f"Minimal P-hacking: Dropped {rejected} tasks to secure a win.",
     }
-
 
 def chart_bounds(scores: list[dict[str, Any]], scale_hack: bool) -> dict[str, float]:
     percents = [row["percent"] for row in scores] or [0]
