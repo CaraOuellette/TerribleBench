@@ -33,3 +33,7 @@ python -m unittest -v
 - Parses `final answer: <integer>`.
 - Produces a leaderboard.
 - Optionally rejects inconvenient tasks and zooms the chart axis until the desired conclusion emerges.
+
+## Auditing Runs
+
+Every run writes a JSON audit log under `run_logs/`. The UI links the current run and `/api/logs/latest`. Logs include generated tasks, prompts, expected answers, raw model outputs, parsed answers, unmodified `rawScores`, and knob-affected `displayedScores`. API keys are not logged.

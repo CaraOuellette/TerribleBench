@@ -23,6 +23,8 @@ DEFAULT_PORT = 8765
 DEFAULT_SITE_URL = "https://github.com/CaraOuellette/TerribleBench"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RUN_LOG_DIR = os.path.join(BASE_DIR, "run_logs")
+SAFE_LOG_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def load_local_env(filename: str = ".env") -> None:
@@ -194,6 +196,52 @@ def clamp_float(value: Any, default: float, low: float, high: float) -> float:
     except (TypeError, ValueError):
         return default
     return max(low, min(high, parsed))
+
+
+def sanitize_request_config(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "targetModel": payload.get("targetModel"),
+        "comparisonModels": payload.get("comparisonModels"),
+        "taskCount": payload.get("taskCount"),
+        "seed": payload.get("seed"),
+        "temperature": payload.get("temperature"),
+        "timeoutSeconds": payload.get("timeoutSeconds"),
+        "demoModeRequested": bool(payload.get("demoMode", True)),
+        "parallel": bool(payload.get("parallel", True)),
+        "includeWeenies": bool(payload.get("includeWeenies", True)),
+        "pHack": bool(payload.get("pHack", False)),
+        "scaleHack": bool(payload.get("scaleHack", False)),
+        "browserApiKeyProvided": bool((payload.get("apiKey") or "").strip()),
+        "envApiKeyAvailable": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
+    }
+
+
+def attach_run_log(result: dict[str, Any], payload: dict[str, Any]) -> None:
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    suffix = f"{stable_int(str(time.time_ns())) & 0xffff:04x}"
+    run_id = f"{stamp}-{result['mode']}-{result['seed']}-{suffix}"
+    filename = f"{run_id}.json"
+    path = os.path.join(RUN_LOG_DIR, filename)
+    relative_path = os.path.relpath(path, BASE_DIR).replace("\\", "/")
+
+    result["runId"] = run_id
+    result["logFile"] = relative_path
+    result["logUrl"] = f"/api/logs/{run_id}"
+    result["latestLogUrl"] = "/api/logs/latest"
+    result["logError"] = None
+
+    artifact = {
+        "request": sanitize_request_config(payload),
+        "run": result,
+    }
+    try:
+        os.makedirs(RUN_LOG_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(artifact, handle, ensure_ascii=False, indent=2)
+        with open(os.path.join(RUN_LOG_DIR, "latest.json"), "w", encoding="utf-8") as handle:
+            json.dump(artifact, handle, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        result["logError"] = str(exc)
 
 
 def dedupe(items: list[str]) -> list[str]:
@@ -830,7 +878,7 @@ def run_benchmark(payload: dict[str, Any]) -> dict[str, Any]:
         {target_model: int(p_hack.get("bonus") or 0)} if p_hack_enabled else None,
     )
 
-    return {
+    result = {
         "app": APP_TITLE,
         "benchName": bench_name,
         "mode": "demo" if demo_mode else "openrouter",
@@ -855,6 +903,8 @@ def run_benchmark(payload: dict[str, Any]) -> dict[str, Any]:
             len(selected_task_ids),
         ),
     }
+    attach_run_log(result, payload)
+    return result
 
 
 HTML = r"""<!doctype html>
@@ -1210,6 +1260,27 @@ HTML = r"""<!doctype html>
       font-size: 12px;
     }
 
+    .audit {
+      margin: 12px 0;
+      padding: 10px 12px;
+      border: 1px solid #d8d0bf;
+      background: #fffefa;
+      border-radius: 6px;
+      color: #353940;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .audit code {
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }
+
+    .audit a {
+      color: var(--blue);
+      font-weight: 800;
+    }
+
     details {
       border-top: 1px solid #ece6d9;
       padding-top: 11px;
@@ -1480,6 +1551,21 @@ HTML = r"""<!doctype html>
         </div>`;
     }
 
+    function renderAudit(data) {
+      if (data.logError) {
+        return `<div class="audit"><b>Run log failed:</b> ${escapeHtml(data.logError)}</div>`;
+      }
+      if (!data.logFile) {
+        return "";
+      }
+      return `
+        <div class="audit">
+          Saved audit log: <code>${escapeHtml(data.logFile)}</code>
+          · <a href="${escapeHtml(data.logUrl)}" target="_blank" rel="noreferrer">open JSON</a>
+          · <a href="${escapeHtml(data.latestLogUrl)}" target="_blank" rel="noreferrer">latest</a>
+        </div>`;
+    }
+
     function renderTasks(data) {
       const selected = new Set(data.pHack.selected_task_ids || []);
       const rows = data.tasks.map(task => `
@@ -1546,6 +1632,7 @@ HTML = r"""<!doctype html>
           ${renderSummary(data)}
           ${renderChart(data)}
           ${renderMetrics(data)}
+          ${renderAudit(data)}
           ${note}
           ${renderTasks(data)}
           ${renderRawResults(data)}
@@ -1616,6 +1703,24 @@ class TerribleBenchHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/health":
             self.send_json(200, {"ok": True, "app": APP_TITLE})
+            return
+        if self.path.startswith("/api/logs/"):
+            log_id = self.path.removeprefix("/api/logs/").strip()
+            if log_id == "latest":
+                filename = "latest.json"
+            elif SAFE_LOG_ID_RE.fullmatch(log_id):
+                filename = f"{log_id}.json"
+            else:
+                self.send_json(400, {"error": "invalid log id"})
+                return
+            path = os.path.join(RUN_LOG_DIR, filename)
+            try:
+                with open(path, "rb") as handle:
+                    body = handle.read()
+            except OSError:
+                self.send_json(404, {"error": "log not found"})
+                return
+            self.send_body(200, body, "application/json; charset=utf-8")
             return
         self.send_json(404, {"error": "not found"})
 
