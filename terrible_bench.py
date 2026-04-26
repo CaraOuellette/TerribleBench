@@ -1019,6 +1019,13 @@ HTML = r"""<!doctype html>
       accent-color: var(--red);
     }
 
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      margin-top: 6px;
+    }
+
     .primary {
       width: 100%;
       min-height: 48px;
@@ -1312,6 +1319,7 @@ HTML = r"""<!doctype html>
         <div class="control-group">
           <label for="apiKey">OpenRouter API Key</label>
           <input id="apiKey" type="password" placeholder="OPENROUTER_API_KEY">
+          <div class="hint" id="keyHint">__KEY_HINT__</div>
         </div>
 
         <div class="control-group">
@@ -1342,7 +1350,7 @@ HTML = r"""<!doctype html>
         </div>
 
         <div class="control-group">
-          <label class="check"><input id="demoMode" type="checkbox" checked><span>Demo mode</span></label>
+          <label class="check"><input id="demoMode" type="checkbox" __DEMO_MODE_CHECKED__><span>Synthetic demo mode</span></label>
           <label class="check"><input id="parallel" type="checkbox" checked><span>Parallel calls</span></label>
           <label class="check"><input id="includeWeenies" type="checkbox" checked><span>Weenie model pile-on</span></label>
           <label class="check"><input id="pHack" type="checkbox" checked><span>P-hack until winning</span></label>
@@ -1369,6 +1377,9 @@ HTML = r"""<!doctype html>
     const results = document.getElementById("results");
     const statusPill = document.getElementById("status");
     const runButton = document.getElementById("runButton");
+    const apiKeyInput = document.getElementById("apiKey");
+    const demoModeInput = document.getElementById("demoMode");
+    const keyHint = document.getElementById("keyHint");
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -1566,6 +1577,15 @@ HTML = r"""<!doctype html>
         runButton.disabled = false;
       }
     });
+
+    apiKeyInput.addEventListener("input", () => {
+      if (apiKeyInput.value.trim()) {
+        demoModeInput.checked = false;
+        keyHint.textContent = "browser key entered; OpenRouter mode ready";
+      } else {
+        keyHint.textContent = "__KEY_HINT__";
+      }
+    });
   </script>
 </body>
 </html>
@@ -1617,8 +1637,18 @@ class TerribleBenchHandler(BaseHTTPRequestHandler):
 
 
 def render_html() -> str:
+    has_server_key = bool(os.environ.get("OPENROUTER_API_KEY", "").strip())
     model_text = html.escape("\n".join(DEFAULT_COMPARISON_MODELS), quote=False)
-    return HTML.replace("__DEFAULT_MODEL_TEXT__", model_text)
+    key_hint = (
+        "server key loaded from environment; OpenRouter mode ready"
+        if has_server_key
+        else "no server key loaded; paste a key and synthetic demo mode will turn off"
+    )
+    return (
+        HTML.replace("__DEFAULT_MODEL_TEXT__", model_text)
+        .replace("__DEMO_MODE_CHECKED__", "" if has_server_key else "checked")
+        .replace("__KEY_HINT__", html.escape(key_hint, quote=False))
+    )
 
 
 def main() -> None:

@@ -10,7 +10,12 @@ python terrible_bench.py
 
 Then open http://127.0.0.1:8765.
 
-The app defaults to demo mode, so it can produce fake-but-plausible lab results without network access or API credits. To run real calls, enter an OpenRouter API key, set `OPENROUTER_API_KEY`, or put `OPENROUTER_API_KEY=...` in `.env`, then uncheck `Demo mode`.
+The app can run in two modes:
+
+- `Synthetic demo mode`: fake-but-plausible results without network access or API credits.
+- `OpenRouter mode`: real model calls, parsed and scored against the generated answer key.
+
+To run real calls, enter an OpenRouter API key, set `OPENROUTER_API_KEY`, or put `OPENROUTER_API_KEY=...` in `.env`. If the app sees a server-side key, synthetic demo mode starts unchecked. If you paste a key into the browser, synthetic demo mode turns off automatically.
 
 OpenRouter attribution uses this repo URL by default. Set `OPENROUTER_SITE_URL` to override it.
 
