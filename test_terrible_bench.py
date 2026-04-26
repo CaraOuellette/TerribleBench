@@ -82,6 +82,35 @@ class TerribleBenchTests(unittest.TestCase):
         self.assertEqual(result["pHack"]["bonus"], 0)
         self.assertTrue(all(row.get("bonus", 0) == 0 for row in result["displayedScores"]))
 
+    def test_weenie_pile_filters_good_models(self) -> None:
+        good_model = "openai/gpt-5"
+        result = run_benchmark(
+            {
+                "targetModel": "my/demo-model",
+                "comparisonModels": f"{good_model}\ntiny/free-model",
+                "taskCount": 1,
+                "seed": 31,
+                "demoMode": True,
+                "includeWeenies": True,
+            }
+        )
+        self.assertNotIn(good_model, result["models"])
+        self.assertIn("tiny/free-model", result["models"])
+
+    def test_good_models_are_kept_without_weenie_pile(self) -> None:
+        good_model = "openai/gpt-5"
+        result = run_benchmark(
+            {
+                "targetModel": "my/demo-model",
+                "comparisonModels": good_model,
+                "taskCount": 1,
+                "seed": 31,
+                "demoMode": True,
+                "includeWeenies": False,
+            }
+        )
+        self.assertIn(good_model, result["models"])
+
     def test_rerun_target_failures_replaces_failed_target_tasks(self) -> None:
         run = {
             "runId": "manual-test-run",

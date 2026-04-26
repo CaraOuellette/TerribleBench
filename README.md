@@ -36,6 +36,7 @@ python -m unittest -v
 - Reports per-model timing, including batch wall time, total API time, average task time, and slowest task.
 - Reloads saved run logs so you can inspect old results without rerunning model calls.
 - Optionally cherry-picks the best observed task subset, reruns the target model's failed tasks, and zooms the chart axis until the desired conclusion emerges.
+- Uses `good_models.txt` as a blocklist when `Weenie model pile-on` is enabled, so strong models do not accidentally join the weenie pool.
 
 ## Auditing Runs
 

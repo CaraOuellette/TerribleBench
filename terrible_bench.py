@@ -69,6 +69,11 @@ FALLBACK_COMPARISON_MODELS = [
 
 DEFAULT_COMPARISON_MODELS = load_lines("model_list.txt") or FALLBACK_COMPARISON_MODELS
 EXTRA_FRUITS = load_lines("fruit_list.txt")
+GOOD_MODEL_BLOCKLIST = {
+    line.lower()
+    for line in load_lines("good_models.txt")
+    if line.lower() not in {"model", "model_name", "models"}
+}
 
 WEENIE_MODELS = [
     "openrouter/auto",
@@ -344,6 +349,12 @@ def dedupe(items: list[str]) -> list[str]:
 def parse_model_list(text: str) -> list[str]:
     rough = re.split(r"[\n,]+", text or "")
     return dedupe([item.strip() for item in rough if item.strip()])
+
+
+def filter_good_models_for_weenie_pile(models: list[str]) -> list[str]:
+    if not GOOD_MODEL_BLOCKLIST:
+        return models
+    return [model for model in models if model.lower() not in GOOD_MODEL_BLOCKLIST]
 
 
 def letters_only(text: str) -> list[str]:
@@ -1036,7 +1047,8 @@ def run_benchmark(
     target_model = (payload.get("targetModel") or "openai/gpt-5.2").strip()
     comparison_models = parse_model_list(payload.get("comparisonModels") or "")
     if payload.get("includeWeenies", True):
-        comparison_models.extend(WEENIE_MODELS)
+        comparison_models = filter_good_models_for_weenie_pile(comparison_models)
+        comparison_models.extend(filter_good_models_for_weenie_pile(WEENIE_MODELS))
     comparison_models = comparison_models or DEFAULT_COMPARISON_MODELS
     models = dedupe([target_model] + comparison_models)
 
@@ -1854,6 +1866,7 @@ HTML = r"""<!doctype html>
           <label class="check"><input id="demoMode" type="checkbox" __DEMO_MODE_CHECKED__><span>Synthetic demo mode</span></label>
           <label class="check"><input id="parallel" type="checkbox" checked><span>Parallel calls</span></label>
           <label class="check"><input id="includeWeenies" type="checkbox" checked><span>Weenie model pile-on</span></label>
+          <div class="hint">When enabled, models in <code>good_models.txt</code> are excluded from the comparison pile.</div>
           <label class="check"><input id="pHack" type="checkbox" checked><span>Cherry-pick best subset</span></label>
           <label class="check"><input id="scaleHack" type="checkbox" checked><span>Suspicious chart axis</span></label>
           <label class="check"><input id="shareKey" type="checkbox"><span>Join public API key leaderboard</span></label>
