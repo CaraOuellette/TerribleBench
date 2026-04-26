@@ -30,10 +30,12 @@ python -m unittest -v
 - Generates one-shot letter-counting and tiny arithmetic benchmarks.
 - Computes the answer key locally.
 - Runs each model against each prompt.
+- Streams per-model progress while calls are in flight.
 - Parses `final answer: <integer>`.
 - Produces a leaderboard.
+- Reports per-model timing, including batch wall time, total API time, average task time, and slowest task.
 - Optionally rejects inconvenient tasks and zooms the chart axis until the desired conclusion emerges.
 
 ## Auditing Runs
 
-Every run writes a JSON audit log under `run_logs/`. The UI links the current run and `/api/logs/latest`. Logs include generated tasks, prompts, expected answers, raw model outputs, parsed answers, unmodified `rawScores`, and knob-affected `displayedScores`. API keys are not logged.
+Every run writes a JSON audit log under `run_logs/`. The UI links the current run and `/api/logs/latest`. Logs include generated tasks, prompts, expected answers, raw model outputs, parsed answers, model timing, unmodified `rawScores`, and knob-affected `displayedScores`. API keys are not logged.

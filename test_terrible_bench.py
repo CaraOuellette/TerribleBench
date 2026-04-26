@@ -34,6 +34,28 @@ class TerribleBenchTests(unittest.TestCase):
         self.assertEqual(result["mode"], "demo")
         self.assertEqual(len(result["tasks"]), 3)
         self.assertGreaterEqual(len(result["displayedScores"]), 2)
+        self.assertEqual(len(result["modelTiming"]), 2)
+        self.assertIn("batch_wall_ms", result["modelTiming"][0])
+
+    def test_progress_callback_reports_each_trial(self) -> None:
+        events = []
+        result = run_benchmark(
+            {
+                "targetModel": "my/demo-model",
+                "comparisonModels": "tiny/free-model",
+                "taskCount": 2,
+                "seed": 19,
+                "demoMode": True,
+                "parallel": True,
+                "includeWeenies": False,
+            },
+            progress_callback=events.append,
+        )
+        self.assertEqual(result["mode"], "demo")
+        self.assertEqual(events[0]["type"], "setup")
+        trial_events = [event for event in events if event["type"] == "trial_complete"]
+        self.assertEqual(len(trial_events), 4)
+        self.assertIn("finished_offset_ms", trial_events[0]["result"])
 
     def test_run_log_does_not_store_api_key(self) -> None:
         secret = "sk-do-not-log-this-test-value"

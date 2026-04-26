@@ -174,7 +174,12 @@ class TrialResult:
     expected: int
     correct: bool
     latency_ms: int
+    start_offset_ms: int = 0
+    finished_offset_ms: int = 0
     error: str | None = None
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 def stable_int(value: str) -> int:
@@ -607,8 +612,10 @@ def run_trial(
     demo_mode: bool,
     temperature: float,
     timeout_seconds: int,
+    run_started_at: float,
 ) -> TrialResult:
     start = time.perf_counter()
+    start_offset_ms = int((start - run_started_at) * 1000)
     try:
         if demo_mode:
             time.sleep(0.02 + (stable_int(f"{model}|{task.id}") % 30) / 1000)
@@ -616,6 +623,7 @@ def run_trial(
         else:
             output = call_openrouter(api_key, model, task.prompt, temperature, timeout_seconds)
         parsed = parse_answer(output)
+        finished = time.perf_counter()
         return TrialResult(
             model=model,
             task_id=task.id,
@@ -623,9 +631,12 @@ def run_trial(
             parsed=parsed,
             expected=task.answer,
             correct=parsed == task.answer,
-            latency_ms=int((time.perf_counter() - start) * 1000),
+            latency_ms=int((finished - start) * 1000),
+            start_offset_ms=start_offset_ms,
+            finished_offset_ms=int((finished - run_started_at) * 1000),
         )
     except Exception as exc:  # The app should report bad science, not crash during it.
+        finished = time.perf_counter()
         return TrialResult(
             model=model,
             task_id=task.id,
@@ -633,7 +644,9 @@ def run_trial(
             parsed=None,
             expected=task.answer,
             correct=False,
-            latency_ms=int((time.perf_counter() - start) * 1000),
+            latency_ms=int((finished - start) * 1000),
+            start_offset_ms=start_offset_ms,
+            finished_offset_ms=int((finished - run_started_at) * 1000),
             error=str(exc)[:500],
         )
 
@@ -648,22 +661,40 @@ def execute_trials(
     parallel: bool,
     temperature: float,
     timeout_seconds: int,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[TrialResult]:
     jobs = [(model, task) for model in models for task in tasks]
-    if not parallel:
-        return [
-            run_trial(
-                model,
-                task,
-                api_key,
-                target_model,
-                seed,
-                demo_mode,
-                temperature,
-                timeout_seconds,
+    run_started_at = time.perf_counter()
+    results: list[TrialResult] = []
+
+    def record_result(result: TrialResult) -> None:
+        results.append(result)
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "trial_complete",
+                    "completed": len(results),
+                    "total": len(jobs),
+                    "result": asdict(result),
+                }
             )
-            for model, task in jobs
-        ]
+
+    if not parallel:
+        for model, task in jobs:
+            record_result(
+                run_trial(
+                    model,
+                    task,
+                    api_key,
+                    target_model,
+                    seed,
+                    demo_mode,
+                    temperature,
+                    timeout_seconds,
+                    run_started_at,
+                )
+            )
+        return results
 
     max_workers = min(24, max(1, len(jobs)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -678,10 +709,47 @@ def execute_trials(
                 demo_mode,
                 temperature,
                 timeout_seconds,
+                run_started_at,
             )
             for model, task in jobs
         ]
-        return [future.result() for future in concurrent.futures.as_completed(futures)]
+        for future in concurrent.futures.as_completed(futures):
+            record_result(future.result())
+    return results
+
+
+def summarize_model_timing(
+    results: list[TrialResult],
+    models: list[str],
+    task_count: int,
+) -> list[dict[str, Any]]:
+    by_model: dict[str, list[TrialResult]] = {model: [] for model in models}
+    for result in results:
+        by_model.setdefault(result.model, []).append(result)
+
+    timings: list[dict[str, Any]] = []
+    for model in models:
+        model_results = by_model.get(model, [])
+        starts = [result.start_offset_ms for result in model_results]
+        finishes = [result.finished_offset_ms for result in model_results]
+        sum_latency = sum(result.latency_ms for result in model_results)
+        completed = len(model_results)
+        timings.append(
+            {
+                "model": model,
+                "completed": completed,
+                "total": task_count,
+                "correct": sum(1 for result in model_results if result.correct),
+                "errors": sum(1 for result in model_results if result.error),
+                "batch_wall_ms": max(finishes) - min(starts) if starts and finishes else 0,
+                "sum_latency_ms": sum_latency,
+                "average_latency_ms": int(sum_latency / max(1, completed)),
+                "first_started_offset_ms": min(starts) if starts else None,
+                "last_finished_offset_ms": max(finishes) if finishes else None,
+                "slowest_task_ms": max((result.latency_ms for result in model_results), default=0),
+            }
+        )
+    return timings
 
 
 def score_models(
@@ -820,7 +888,10 @@ def make_summary(
     }
 
 
-def run_benchmark(payload: dict[str, Any]) -> dict[str, Any]:
+def run_benchmark(
+    payload: dict[str, Any],
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
     target_model = (payload.get("targetModel") or "openai/gpt-5.2").strip()
     comparison_models = parse_model_list(payload.get("comparisonModels") or "")
     if payload.get("includeWeenies", True):
@@ -842,10 +913,23 @@ def run_benchmark(payload: dict[str, Any]) -> dict[str, Any]:
     browser_key = (payload.get("apiKey") or "").strip()
     api_key = browser_key or os.environ.get("OPENROUTER_API_KEY", "").strip()
     demo_mode = bool(payload.get("demoMode", True)) or not api_key
+    mode = "demo" if demo_mode else "openrouter"
     parallel = bool(payload.get("parallel", True))
 
     tasks = [build_task(rng, index) for index in range(task_count)]
     bench_name = make_benchmark_name(rng)
+    if progress_callback:
+        progress_callback(
+            {
+                "type": "setup",
+                "benchName": bench_name,
+                "mode": mode,
+                "seed": seed,
+                "models": models,
+                "tasks": [asdict(task) for task in tasks],
+                "total": len(models) * len(tasks),
+            }
+        )
     results = execute_trials(
         models=models,
         tasks=tasks,
@@ -856,6 +940,7 @@ def run_benchmark(payload: dict[str, Any]) -> dict[str, Any]:
         parallel=parallel,
         temperature=temperature,
         timeout_seconds=timeout_seconds,
+        progress_callback=progress_callback,
     )
 
     all_task_ids = [task.id for task in tasks]
@@ -881,12 +966,13 @@ def run_benchmark(payload: dict[str, Any]) -> dict[str, Any]:
     result = {
         "app": APP_TITLE,
         "benchName": bench_name,
-        "mode": "demo" if demo_mode else "openrouter",
+        "mode": mode,
         "seed": seed,
         "targetModel": target_model,
         "models": models,
         "tasks": [asdict(task) for task in tasks],
         "results": [asdict(result) for result in results],
+        "modelTiming": summarize_model_timing(results, models, len(tasks)),
         "rawScores": raw_scores,
         "displayedScores": displayed_scores,
         "pHack": {
@@ -1124,6 +1210,13 @@ HTML = r"""<!doctype html>
       text-align: center;
     }
 
+    .loading-card {
+      width: min(760px, 100%);
+      display: grid;
+      justify-items: center;
+      gap: 14px;
+    }
+
     .throbber {
       width: 86px;
       height: 86px;
@@ -1135,6 +1228,74 @@ HTML = r"""<!doctype html>
     }
 
     @keyframes rotate { to { transform: rotate(360deg); } }
+
+    .progress-content {
+      width: 100%;
+      text-align: left;
+      border: 1px solid #e1dacd;
+      border-radius: 8px;
+      background: #fffefa;
+      padding: 12px;
+    }
+
+    .progress-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      color: #353940;
+      font-size: 13px;
+      font-weight: 800;
+      margin-bottom: 10px;
+    }
+
+    .progress-eta {
+      color: var(--muted);
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .progress-row {
+      display: grid;
+      grid-template-columns: minmax(150px, 260px) minmax(0, 1fr) 115px;
+      gap: 10px;
+      align-items: center;
+      min-height: 34px;
+      border-top: 1px solid #eee8dd;
+      padding: 7px 0;
+    }
+
+    .progress-track {
+      height: 17px;
+      border-radius: 5px;
+      border: 1px solid #d8d0bf;
+      background: #eee9dd;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      min-width: 2px;
+      background: var(--gold);
+    }
+
+    .progress-fill.done {
+      background: var(--green);
+    }
+
+    .progress-meta {
+      color: var(--muted);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+
+    .progress-latest {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 3px;
+      min-height: 16px;
+    }
 
     .result-body {
       padding: 16px;
@@ -1360,6 +1521,15 @@ HTML = r"""<!doctype html>
         border-bottom: 1px solid #eee8dd;
       }
 
+      .progress-row {
+        grid-template-columns: 1fr;
+        gap: 5px;
+      }
+
+      .progress-meta {
+        text-align: left;
+      }
+
       .score {
         text-align: left;
       }
@@ -1451,6 +1621,7 @@ HTML = r"""<!doctype html>
     const apiKeyInput = document.getElementById("apiKey");
     const demoModeInput = document.getElementById("demoMode");
     const keyHint = document.getElementById("keyHint");
+    let progressState = null;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -1467,6 +1638,25 @@ HTML = r"""<!doctype html>
 
     function checked(id) {
       return document.getElementById(id).checked;
+    }
+
+    function formatDuration(ms) {
+      const value = Math.max(0, Number(ms) || 0);
+      if (value < 1000) {
+        return `${Math.round(value)}ms`;
+      }
+      const seconds = value / 1000;
+      if (seconds < 60) {
+        return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+      }
+      const minutes = Math.floor(seconds / 60);
+      const remainder = Math.round(seconds % 60);
+      return `${minutes}m ${remainder}s`;
+    }
+
+    function percent(part, total) {
+      if (!total) return 0;
+      return Math.max(0, Math.min(100, (Number(part) / Number(total)) * 100));
     }
 
     function payloadFromForm() {
@@ -1488,14 +1678,110 @@ HTML = r"""<!doctype html>
     }
 
     function showLoading() {
+      progressState = null;
       results.innerHTML = `
         <div class="loading">
-          <div class="throbber" aria-hidden="true"></div>
-          <div>
-            <strong>Generating regrettable science...</strong><br>
-            <span>contacting the standards committee</span>
+          <div class="loading-card">
+            <div class="throbber" aria-hidden="true"></div>
+            <div>
+              <strong>Generating regrettable science...</strong><br>
+              <span>contacting the standards committee</span>
+            </div>
+            <div id="progressContent" class="progress-content">
+              <div class="progress-head">
+                <span>Preparing prompts</span>
+                <span class="progress-eta">warming up</span>
+              </div>
+              <div class="progress-latest">Waiting for the run manifest.</div>
+            </div>
           </div>
         </div>`;
+    }
+
+    function initializeProgress(data) {
+      progressState = {
+        startedAt: performance.now(),
+        benchName: data.benchName,
+        mode: data.mode,
+        models: data.models,
+        taskCount: data.tasks.length,
+        total: data.total,
+        completed: 0,
+        byModel: Object.fromEntries(data.models.map(model => [model, {
+          model,
+          completed: 0,
+          correct: 0,
+          errors: 0,
+          sumLatencyMs: 0,
+          firstStartMs: null,
+          lastFinishMs: null,
+          batchWallMs: 0,
+          latest: "queued"
+        }]))
+      };
+      renderProgress();
+    }
+
+    function updateProgress(data) {
+      if (!progressState || !data.result) return;
+      const result = data.result;
+      const model = progressState.byModel[result.model];
+      if (!model) return;
+      progressState.completed = data.completed;
+      progressState.total = data.total;
+      model.completed += 1;
+      model.correct += result.correct ? 1 : 0;
+      model.errors += result.error ? 1 : 0;
+      model.sumLatencyMs += Number(result.latency_ms) || 0;
+      const start = Number(result.start_offset_ms) || 0;
+      const finish = Number(result.finished_offset_ms) || 0;
+      model.firstStartMs = model.firstStartMs === null ? start : Math.min(model.firstStartMs, start);
+      model.lastFinishMs = model.lastFinishMs === null ? finish : Math.max(model.lastFinishMs, finish);
+      model.batchWallMs = Math.max(0, model.lastFinishMs - model.firstStartMs);
+      const status = result.error ? "error" : (result.correct ? "pass" : "fail");
+      model.latest = `${result.task_id} ${status} in ${formatDuration(result.latency_ms)}`;
+      renderProgress();
+    }
+
+    function renderProgress() {
+      const node = document.getElementById("progressContent");
+      if (!node || !progressState) return;
+      const elapsed = performance.now() - progressState.startedAt;
+      const done = progressState.completed >= progressState.total;
+      const etaMs = progressState.completed > 0 && !done
+        ? ((progressState.total - progressState.completed) / (progressState.completed / Math.max(1, elapsed)))
+        : null;
+      const rows = progressState.models.map(modelName => {
+        const model = progressState.byModel[modelName];
+        const width = percent(model.completed, progressState.taskCount);
+        const complete = model.completed >= progressState.taskCount;
+        const timing = complete
+          ? `${formatDuration(model.batchWallMs)} batch`
+          : (model.completed ? `${formatDuration(model.batchWallMs)} so far` : "queued");
+        return `
+          <div class="progress-row">
+            <div>
+              <div class="model-name" title="${escapeHtml(modelName)}">${escapeHtml(modelName)}</div>
+              <div class="progress-latest">${escapeHtml(model.latest)}</div>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill ${complete ? "done" : ""}" style="width:${width}%"></div>
+            </div>
+            <div class="progress-meta">${model.completed}/${progressState.taskCount} - ${escapeHtml(timing)}</div>
+          </div>`;
+      }).join("");
+      const eta = done
+        ? "finishing report"
+        : (etaMs === null ? "estimating ETA" : `ETA ${formatDuration(etaMs)}`);
+      node.innerHTML = `
+        <div class="progress-head">
+          <span>${escapeHtml(progressState.benchName)} - ${progressState.completed}/${progressState.total} calls</span>
+          <span class="progress-eta">${escapeHtml(eta)}</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill ${done ? "done" : ""}" style="width:${percent(progressState.completed, progressState.total)}%"></div>
+        </div>
+        ${rows}`;
     }
 
     function showError(error) {
@@ -1561,9 +1847,31 @@ HTML = r"""<!doctype html>
       return `
         <div class="audit">
           Saved audit log: <code>${escapeHtml(data.logFile)}</code>
-          · <a href="${escapeHtml(data.logUrl)}" target="_blank" rel="noreferrer">open JSON</a>
-          · <a href="${escapeHtml(data.latestLogUrl)}" target="_blank" rel="noreferrer">latest</a>
+          - <a href="${escapeHtml(data.logUrl)}" target="_blank" rel="noreferrer">open JSON</a>
+          - <a href="${escapeHtml(data.latestLogUrl)}" target="_blank" rel="noreferrer">latest</a>
         </div>`;
+    }
+
+    function renderModelTiming(data) {
+      const rows = (data.modelTiming || []).map(timing => `
+        <tr>
+          <td title="${escapeHtml(timing.model)}">${escapeHtml(timing.model)}</td>
+          <td>${escapeHtml(timing.completed)}/${escapeHtml(timing.total)}</td>
+          <td>${escapeHtml(timing.correct)}</td>
+          <td>${escapeHtml(timing.errors)}</td>
+          <td>${formatDuration(timing.batch_wall_ms)}</td>
+          <td>${formatDuration(timing.sum_latency_ms)}</td>
+          <td>${formatDuration(timing.average_latency_ms)}</td>
+          <td>${formatDuration(timing.slowest_task_ms)}</td>
+        </tr>`).join("");
+      return `
+        <details open>
+          <summary>Model Timing</summary>
+          <table>
+            <thead><tr><th>Model</th><th>Done</th><th>Correct</th><th>Errors</th><th>Batch Wall</th><th>Total API Time</th><th>Avg Task</th><th>Slowest Task</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </details>`;
     }
 
     function renderTasks(data) {
@@ -1625,7 +1933,7 @@ HTML = r"""<!doctype html>
           <div class="bench-title">
             <div>
               <h2>${escapeHtml(data.benchName)}</h2>
-              <div class="subtitle">seed ${escapeHtml(data.seed)} · ${escapeHtml(data.models.length)} models · ${escapeHtml(data.tasks.length)} prompts</div>
+              <div class="subtitle">seed ${escapeHtml(data.seed)} - ${escapeHtml(data.models.length)} models - ${escapeHtml(data.tasks.length)} prompts</div>
             </div>
             <div class="mode">${data.mode === "demo" ? "demo lab" : "OpenRouter lab"}</div>
           </div>
@@ -1634,9 +1942,76 @@ HTML = r"""<!doctype html>
           ${renderMetrics(data)}
           ${renderAudit(data)}
           ${note}
+          ${renderModelTiming(data)}
           ${renderTasks(data)}
           ${renderRawResults(data)}
         </div>`;
+    }
+
+    function parseStreamBlock(block) {
+      const lines = block.split(/\r?\n/);
+      let eventName = "message";
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+      return {
+        eventName,
+        data: dataLines.length ? JSON.parse(dataLines.join("\n")) : null
+      };
+    }
+
+    async function runStreaming(payload) {
+      const response = await fetch("/api/run-stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Benchmark failed.");
+      }
+      if (!response.body) {
+        throw new Error("This browser did not expose a response stream.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalData = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary).trim();
+          buffer = buffer.slice(boundary + 2);
+          if (block) {
+            const event = parseStreamBlock(block);
+            if (event.eventName === "setup") {
+              initializeProgress(event.data);
+            } else if (event.eventName === "trial_complete") {
+              updateProgress(event.data);
+            } else if (event.eventName === "complete") {
+              finalData = event.data;
+            } else if (event.eventName === "error") {
+              throw new Error(event.data?.error || "Benchmark failed.");
+            }
+          }
+          boundary = buffer.indexOf("\n\n");
+        }
+      }
+
+      if (!finalData) {
+        throw new Error("Benchmark stream ended before the final report arrived.");
+      }
+      return finalData;
     }
 
     form.addEventListener("submit", async (event) => {
@@ -1646,15 +2021,7 @@ HTML = r"""<!doctype html>
       runButton.disabled = true;
       showLoading();
       try {
-        const response = await fetch("/api/run", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || "Benchmark failed.");
-        }
+        const data = await runStreaming(payload);
         renderResults(data);
         statusPill.textContent = `local peer review board: ${data.mode}`;
       } catch (error) {
@@ -1697,6 +2064,26 @@ class TerribleBenchHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_body(status, body, "application/json; charset=utf-8")
 
+    def read_json_payload(self) -> dict[str, Any] | None:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 2_000_000:
+            return None
+        body = self.rfile.read(length)
+        return json.loads(body.decode("utf-8") or "{}")
+
+    def send_stream_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def send_stream_event(self, event_name: str, payload: dict[str, Any]) -> None:
+        data = json.dumps(payload, ensure_ascii=False)
+        body = f"event: {event_name}\ndata: {data}\n\n".encode("utf-8")
+        self.wfile.write(body)
+        self.wfile.flush()
+
     def do_GET(self) -> None:
         if self.path in {"/", "/index.html"}:
             self.send_body(200, render_html().encode("utf-8"), "text/html; charset=utf-8")
@@ -1725,20 +2112,43 @@ class TerribleBenchHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        if self.path == "/api/run-stream":
+            self.handle_run_stream()
+            return
         if self.path != "/api/run":
             self.send_json(404, {"error": "not found"})
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length > 2_000_000:
+            payload = self.read_json_payload()
+            if payload is None:
                 self.send_json(413, {"error": "request too large"})
                 return
-            body = self.rfile.read(length)
-            payload = json.loads(body.decode("utf-8") or "{}")
             result = run_benchmark(payload)
             self.send_json(200, result)
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
+
+    def handle_run_stream(self) -> None:
+        try:
+            payload = self.read_json_payload()
+            if payload is None:
+                self.send_json(413, {"error": "request too large"})
+                return
+        except Exception as exc:
+            self.send_json(400, {"error": str(exc)})
+            return
+
+        self.send_stream_headers()
+
+        def emit(event: dict[str, Any]) -> None:
+            event_name = str(event.get("type") or "message")
+            self.send_stream_event(event_name, event)
+
+        try:
+            result = run_benchmark(payload, progress_callback=emit)
+            self.send_stream_event("complete", result)
+        except Exception as exc:
+            self.send_stream_event("error", {"error": str(exc)})
 
 
 def render_html() -> str:
