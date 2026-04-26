@@ -21,6 +21,10 @@ APP_TITLE = "Terrible Bench.ai"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_PORT = 8765
 DEFAULT_SITE_URL = "https://github.com/CaraOuellette/TerribleBench"
+DEFAULT_COMPLETION_TOKENS = 32
+DEFAULT_TARGET_COMPLETION_TOKENS = 1200
+DEFAULT_HEALTH_CHECK_TOKENS = 64
+DEFAULT_COMPARISON_LIMIT_SECONDS = 15
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUN_LOG_DIR = os.path.join(BASE_DIR, "run_logs")
@@ -184,6 +188,17 @@ class TrialResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class ModelHealthCheck:
+    model: str
+    ok: bool
+    output: str
+    parsed: int | None
+    expected: int
+    latency_ms: int
+    error: str | None = None
+
+
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -216,6 +231,9 @@ def sanitize_request_config(payload: dict[str, Any]) -> dict[str, Any]:
         "seed": payload.get("seed"),
         "temperature": payload.get("temperature"),
         "timeoutSeconds": payload.get("timeoutSeconds"),
+        "targetMaxTokens": payload.get("targetMaxTokens"),
+        "comparisonTimeoutSeconds": payload.get("comparisonTimeoutSeconds"),
+        "preflightModels": bool(payload.get("preflightModels", True)),
         "demoModeRequested": bool(payload.get("demoMode", True)),
         "parallel": bool(payload.get("parallel", True)),
         "includeWeenies": bool(payload.get("includeWeenies", True)),
@@ -616,6 +634,7 @@ def call_openrouter(
     prompt: str,
     temperature: float,
     timeout_seconds: int,
+    max_tokens: int = DEFAULT_COMPLETION_TOKENS,
 ) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -633,7 +652,7 @@ def call_openrouter(
             {"role": "user", "content": prompt},
         ],
         "temperature": temperature,
-        "max_tokens": 32,
+        "max_tokens": max_tokens,
     }
     response = requests.post(
         OPENROUTER_URL,
@@ -695,6 +714,129 @@ def synthetic_output(model: str, task: BenchmarkTask, target_model: str, seed: i
     return rng.choice(styles).format(answer=predicted)
 
 
+def run_model_health_check(
+    model: str,
+    api_key: str,
+    demo_mode: bool,
+    temperature: float,
+    timeout_seconds: int,
+) -> ModelHealthCheck:
+    start = time.perf_counter()
+    expected = 1
+    prompt = (
+        "Health check for a benchmark run. Reply with exactly one line:\n"
+        "final answer: 1"
+    )
+    try:
+        if demo_mode:
+            time.sleep(0.01 + (stable_int(f"health|{model}") % 20) / 1000)
+            output = "final answer: 1"
+        else:
+            output = call_openrouter(
+                api_key,
+                model,
+                prompt,
+                temperature,
+                timeout_seconds,
+                max_tokens=DEFAULT_HEALTH_CHECK_TOKENS,
+            )
+        parsed = parse_answer(output)
+        ok = parsed == expected
+        return ModelHealthCheck(
+            model=model,
+            ok=ok,
+            output=output.strip(),
+            parsed=parsed,
+            expected=expected,
+            latency_ms=int((time.perf_counter() - start) * 1000),
+            error=None if ok else f"health probe parsed {parsed!r}, expected {expected}",
+        )
+    except Exception as exc:
+        return ModelHealthCheck(
+            model=model,
+            ok=False,
+            output="",
+            parsed=None,
+            expected=expected,
+            latency_ms=int((time.perf_counter() - start) * 1000),
+            error=str(exc)[:500],
+        )
+
+
+def execute_model_health_checks(
+    models: list[str],
+    api_key: str,
+    demo_mode: bool,
+    temperature: float,
+    timeout_seconds: int,
+    progress_callback: ProgressCallback | None = None,
+) -> list[ModelHealthCheck]:
+    if progress_callback:
+        progress_callback(
+            {
+                "type": "health_setup",
+                "models": models,
+                "total": len(models),
+            }
+        )
+
+    completed = 0
+    by_model: dict[str, ModelHealthCheck] = {}
+
+    def record(check: ModelHealthCheck) -> None:
+        nonlocal completed
+        completed += 1
+        by_model[check.model] = check
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "health_complete",
+                    "completed": completed,
+                    "total": len(models),
+                    "check": asdict(check),
+                }
+            )
+
+    max_workers = min(12, max(1, len(models)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                run_model_health_check,
+                model,
+                api_key,
+                demo_mode,
+                temperature,
+                timeout_seconds,
+            )
+            for model in models
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            record(future.result())
+
+    return [by_model[model] for model in models if model in by_model]
+
+
+def deadline_trial_result(
+    model: str,
+    task: BenchmarkTask,
+    run_started_at: float,
+    start: float,
+) -> TrialResult:
+    finished = time.perf_counter()
+    return TrialResult(
+        model=model,
+        task_id=task.id,
+        output="",
+        parsed=None,
+        expected=task.answer,
+        correct=False,
+        latency_ms=int((finished - start) * 1000),
+        start_offset_ms=int((start - run_started_at) * 1000),
+        finished_offset_ms=int((finished - run_started_at) * 1000),
+        error="Skipped because the non-target model time limit elapsed.",
+    )
+
+
 def run_trial(
     model: str,
     task: BenchmarkTask,
@@ -704,16 +846,33 @@ def run_trial(
     demo_mode: bool,
     temperature: float,
     timeout_seconds: int,
+    target_max_tokens: int,
+    comparison_deadline: float | None,
     run_started_at: float,
 ) -> TrialResult:
     start = time.perf_counter()
     start_offset_ms = int((start - run_started_at) * 1000)
+    is_target = model == target_model
+    request_timeout_seconds = timeout_seconds
+    request_max_tokens = target_max_tokens if is_target else DEFAULT_COMPLETION_TOKENS
+    if not is_target and comparison_deadline is not None:
+        remaining = comparison_deadline - time.perf_counter()
+        if remaining <= 0:
+            return deadline_trial_result(model, task, run_started_at, start)
+        request_timeout_seconds = max(1, min(timeout_seconds, int(remaining) + 1))
     try:
         if demo_mode:
             time.sleep(0.02 + (stable_int(f"{model}|{task.id}") % 30) / 1000)
             output = synthetic_output(model, task, target_model, seed)
         else:
-            output = call_openrouter(api_key, model, task.prompt, temperature, timeout_seconds)
+            output = call_openrouter(
+                api_key,
+                model,
+                task.prompt,
+                temperature,
+                request_timeout_seconds,
+                max_tokens=request_max_tokens,
+            )
         parsed = parse_answer(output)
         finished = time.perf_counter()
         return TrialResult(
@@ -753,9 +912,18 @@ def execute_trials(
     parallel: bool,
     temperature: float,
     timeout_seconds: int,
+    target_max_tokens: int,
+    comparison_timeout_seconds: int,
     progress_callback: ProgressCallback | None = None,
 ) -> list[TrialResult]:
-    jobs = [(model, task) for model in models for task in tasks]
+    target_jobs = [(model, task) for model in models if model == target_model for task in tasks]
+    comparison_models = [model for model in models if model != target_model]
+    comparison_jobs = [
+        (model, task)
+        for model in comparison_models
+        for task in tasks
+    ]
+    jobs = [(model, task) for task in tasks for model in models]
     run_started_at = time.perf_counter()
     results: list[TrialResult] = []
 
@@ -772,7 +940,7 @@ def execute_trials(
             )
 
     if not parallel:
-        for model, task in jobs:
+        for model, task in target_jobs:
             record_result(
                 run_trial(
                     model,
@@ -783,11 +951,39 @@ def execute_trials(
                     demo_mode,
                     temperature,
                     timeout_seconds,
+                    target_max_tokens,
+                    None,
+                    run_started_at,
+                )
+            )
+        comparison_deadline = (
+            time.perf_counter() + comparison_timeout_seconds
+            if comparison_jobs
+            else None
+        )
+        for model, task in comparison_jobs:
+            record_result(
+                run_trial(
+                    model,
+                    task,
+                    api_key,
+                    target_model,
+                    seed,
+                    demo_mode,
+                    temperature,
+                    timeout_seconds,
+                    target_max_tokens,
+                    comparison_deadline,
                     run_started_at,
                 )
             )
         return results
 
+    comparison_deadline = (
+        time.perf_counter() + comparison_timeout_seconds
+        if comparison_jobs
+        else None
+    )
     max_workers = min(24, max(1, len(jobs)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
@@ -801,6 +997,8 @@ def execute_trials(
                 demo_mode,
                 temperature,
                 timeout_seconds,
+                target_max_tokens,
+                comparison_deadline,
                 run_started_at,
             )
             for model, task in jobs
@@ -992,6 +1190,11 @@ def build_report(
     p_hack_enabled: bool,
     scale_hack: bool,
     payload: dict[str, Any],
+    health_checks: list[ModelHealthCheck] | None = None,
+    preflight_enabled: bool = False,
+    skipped_models: list[str] | None = None,
+    target_max_tokens: int = DEFAULT_TARGET_COMPLETION_TOKENS,
+    comparison_timeout_seconds: int = DEFAULT_COMPARISON_LIMIT_SECONDS,
     rerun: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     all_task_ids = [task.id for task in tasks]
@@ -1007,6 +1210,8 @@ def build_report(
     selected_task_ids = p_hack["selected_task_ids"]
     raw_scores = score_models(results, models, all_task_ids)
     displayed_scores = score_models(results, models, selected_task_ids)
+    health_checks = health_checks or []
+    skipped_models = skipped_models or []
 
     report = {
         "app": APP_TITLE,
@@ -1017,6 +1222,19 @@ def build_report(
         "models": models,
         "tasks": [asdict(task) for task in tasks],
         "results": [asdict(result) for result in results],
+        "healthChecks": [asdict(check) for check in health_checks],
+        "preflight": {
+            "enabled": preflight_enabled,
+            "checked": len(health_checks),
+            "passed": sum(1 for check in health_checks if check.ok),
+            "failed": sum(1 for check in health_checks if not check.ok),
+            "skippedComparisonModels": skipped_models,
+        },
+        "runtimeLimits": {
+            "targetMaxTokens": target_max_tokens,
+            "comparisonTimeoutSeconds": comparison_timeout_seconds,
+            "comparisonMaxTokens": DEFAULT_COMPLETION_TOKENS,
+        },
         "modelTiming": summarize_model_timing(results, models, len(tasks)),
         "rawScores": raw_scores,
         "displayedScores": displayed_scores,
@@ -1061,6 +1279,18 @@ def run_benchmark(
     rng = random.Random(seed)
     task_count = clamp_int(payload.get("taskCount"), 8, 1, 48)
     timeout_seconds = clamp_int(payload.get("timeoutSeconds"), 30, 5, 120)
+    target_max_tokens = clamp_int(
+        payload.get("targetMaxTokens"),
+        DEFAULT_TARGET_COMPLETION_TOKENS,
+        1000,
+        8192,
+    )
+    comparison_timeout_seconds = clamp_int(
+        payload.get("comparisonTimeoutSeconds"),
+        DEFAULT_COMPARISON_LIMIT_SECONDS,
+        1,
+        120,
+    )
     temperature = clamp_float(payload.get("temperature"), 0.0, 0.0, 2.0)
 
     browser_key = (payload.get("apiKey") or "").strip()
@@ -1068,9 +1298,37 @@ def run_benchmark(
     demo_mode = bool(payload.get("demoMode", True)) or not api_key
     mode = "demo" if demo_mode else "openrouter"
     parallel = bool(payload.get("parallel", True))
+    preflight_enabled = bool(payload.get("preflightModels", True))
 
     tasks = [build_task(rng, index) for index in range(task_count)]
     bench_name = make_benchmark_name(rng)
+    health_checks: list[ModelHealthCheck] = []
+    skipped_models: list[str] = []
+    if preflight_enabled:
+        health_timeout_seconds = min(timeout_seconds, 10)
+        health_checks = execute_model_health_checks(
+            models=models,
+            api_key=api_key,
+            demo_mode=demo_mode,
+            temperature=temperature,
+            timeout_seconds=health_timeout_seconds,
+            progress_callback=progress_callback,
+        )
+        health_by_model = {check.model: check for check in health_checks}
+        target_health = health_by_model.get(target_model)
+        if target_health and not target_health.ok:
+            reason = target_health.error or target_health.output or "unknown error"
+            raise RuntimeError(f"Target model failed preflight: {reason}")
+        def health_ok(model: str) -> bool:
+            check = health_by_model.get(model)
+            return True if check is None else check.ok
+
+        skipped_models = [
+            model
+            for model in models
+            if model != target_model and not health_ok(model)
+        ]
+        models = [model for model in models if model == target_model or model not in skipped_models]
     if progress_callback:
         progress_callback(
             {
@@ -1093,6 +1351,8 @@ def run_benchmark(
         parallel=parallel,
         temperature=temperature,
         timeout_seconds=timeout_seconds,
+        target_max_tokens=target_max_tokens,
+        comparison_timeout_seconds=comparison_timeout_seconds,
         progress_callback=progress_callback,
     )
 
@@ -1108,6 +1368,11 @@ def run_benchmark(
         p_hack_enabled=p_hack_enabled,
         scale_hack=bool(payload.get("scaleHack", False)),
         payload=payload,
+        health_checks=health_checks,
+        preflight_enabled=preflight_enabled,
+        skipped_models=skipped_models,
+        target_max_tokens=target_max_tokens,
+        comparison_timeout_seconds=comparison_timeout_seconds,
     )
 
 
@@ -1158,6 +1423,18 @@ def rerun_target_failures(
     retry_seed = int(time.time() * 1000) % 2_147_483_647
     temperature = clamp_float(payload.get("temperature"), 0.0, 0.0, 2.0)
     timeout_seconds = clamp_int(payload.get("timeoutSeconds"), 30, 5, 120)
+    target_max_tokens = clamp_int(
+        payload.get("targetMaxTokens"),
+        DEFAULT_TARGET_COMPLETION_TOKENS,
+        1000,
+        8192,
+    )
+    comparison_timeout_seconds = clamp_int(
+        payload.get("comparisonTimeoutSeconds"),
+        DEFAULT_COMPARISON_LIMIT_SECONDS,
+        1,
+        120,
+    )
     parallel = bool(payload.get("parallel", True))
 
     retry_results: list[TrialResult] = []
@@ -1184,6 +1461,8 @@ def rerun_target_failures(
             parallel=parallel,
             temperature=temperature,
             timeout_seconds=timeout_seconds,
+            target_max_tokens=target_max_tokens,
+            comparison_timeout_seconds=comparison_timeout_seconds,
             progress_callback=progress_callback,
         )
         for result in retry_results:
@@ -1238,6 +1517,8 @@ def rerun_target_failures(
         p_hack_enabled=p_hack_enabled,
         scale_hack=scale_hack,
         payload=rerun_payload,
+        target_max_tokens=target_max_tokens,
+        comparison_timeout_seconds=comparison_timeout_seconds,
         rerun=rerun,
     )
 
@@ -1555,6 +1836,10 @@ HTML = r"""<!doctype html>
       background: var(--green);
     }
 
+    .progress-fill.failed {
+      background: var(--red);
+    }
+
     .progress-meta {
       color: var(--muted);
       font-size: 12px;
@@ -1862,8 +2147,20 @@ HTML = r"""<!doctype html>
           </div>
         </div>
 
+        <div class="control-group split">
+          <div>
+            <label for="targetMaxTokens">Target tokens</label>
+            <input id="targetMaxTokens" type="number" min="1000" max="8192" value="1200">
+          </div>
+          <div>
+            <label for="comparisonTimeoutSeconds">Rival cap</label>
+            <input id="comparisonTimeoutSeconds" type="number" min="1" max="120" value="15">
+          </div>
+        </div>
+
         <div class="control-group">
           <label class="check"><input id="demoMode" type="checkbox" __DEMO_MODE_CHECKED__><span>Synthetic demo mode</span></label>
+          <label class="check"><input id="preflightModels" type="checkbox" checked><span>Preflight model health check</span></label>
           <label class="check"><input id="parallel" type="checkbox" checked><span>Parallel calls</span></label>
           <label class="check"><input id="includeWeenies" type="checkbox" checked><span>Weenie model pile-on</span></label>
           <div class="hint">When enabled, models in <code>good_models.txt</code> are excluded from the comparison pile.</div>
@@ -1958,7 +2255,10 @@ HTML = r"""<!doctype html>
         seed: value("seed"),
         temperature: Number(value("temperature")),
         timeoutSeconds: Number(value("timeoutSeconds")),
+        targetMaxTokens: Number(value("targetMaxTokens")),
+        comparisonTimeoutSeconds: Number(value("comparisonTimeoutSeconds")),
         demoMode: checked("demoMode"),
+        preflightModels: checked("preflightModels"),
         parallel: checked("parallel"),
         includeWeenies: checked("includeWeenies"),
         pHack: checked("pHack"),
@@ -1988,8 +2288,76 @@ HTML = r"""<!doctype html>
         </div>`;
     }
 
+    function initializeHealthProgress(data) {
+      progressState = {
+        phase: "health",
+        startedAt: performance.now(),
+        models: data.models,
+        total: data.total,
+        completed: 0,
+        byModel: Object.fromEntries(data.models.map(model => [model, {
+          model,
+          completed: 0,
+          ok: null,
+          latencyMs: 0,
+          latest: "queued"
+        }]))
+      };
+      renderHealthProgress();
+    }
+
+    function updateHealthProgress(data) {
+      if (!progressState || progressState.phase !== "health" || !data.check) return;
+      const check = data.check;
+      const model = progressState.byModel[check.model];
+      if (!model) return;
+      progressState.completed = data.completed;
+      progressState.total = data.total;
+      model.completed = 1;
+      model.ok = Boolean(check.ok);
+      model.latencyMs = Number(check.latency_ms) || 0;
+      model.latest = check.ok
+        ? `responded in ${formatDuration(check.latency_ms)}`
+        : `failed: ${check.error || "bad probe"}`;
+      renderHealthProgress();
+    }
+
+    function renderHealthProgress() {
+      const node = document.getElementById("progressContent");
+      if (!node || !progressState || progressState.phase !== "health") return;
+      const rows = progressState.models.map(modelName => {
+        const model = progressState.byModel[modelName];
+        const complete = model.completed >= 1;
+        const failed = complete && model.ok === false;
+        const width = complete ? 100 : 0;
+        const timing = complete ? formatDuration(model.latencyMs) : "queued";
+        return `
+          <div class="progress-row">
+            <div>
+              <div class="model-name" title="${escapeHtml(modelName)}">${escapeHtml(modelName)}</div>
+              <div class="progress-latest">${escapeHtml(model.latest)}</div>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill ${failed ? "failed" : (complete ? "done" : "")}" style="width:${width}%"></div>
+            </div>
+            <div class="progress-meta">${complete ? (failed ? "fail" : "ok") : "0/1"} - ${escapeHtml(timing)}</div>
+          </div>`;
+      }).join("");
+      const done = progressState.completed >= progressState.total;
+      node.innerHTML = `
+        <div class="progress-head">
+          <span>Model health check - ${progressState.completed}/${progressState.total} probes</span>
+          <span class="progress-eta">${done ? "starting benchmark" : "checking"}</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill ${done ? "done" : ""}" style="width:${percent(progressState.completed, progressState.total)}%"></div>
+        </div>
+        ${rows}`;
+    }
+
     function initializeProgress(data) {
       progressState = {
+        phase: "benchmark",
         startedAt: performance.now(),
         benchName: data.benchName,
         mode: data.mode,
@@ -2193,6 +2561,40 @@ HTML = r"""<!doctype html>
         </div>`;
     }
 
+    function renderHealthChecks(data) {
+      const checks = data.healthChecks || [];
+      const limits = data.runtimeLimits || {};
+      const skipped = data.preflight?.skippedComparisonModels || [];
+      const preflightNote = data.preflight?.enabled
+        ? `${checks.filter(check => check.ok).length}/${checks.length} probes passed`
+        : "preflight disabled";
+      const skippedNote = skipped.length
+        ? `<div class="hint">Skipped rivals after preflight: ${escapeHtml(skipped.join(", "))}</div>`
+        : "";
+      const rows = checks.map(check => `
+        <tr>
+          <td title="${escapeHtml(check.model)}">${escapeHtml(check.model)}</td>
+          <td>${check.ok ? '<span class="ok">ok</span>' : '<span class="bad">failed</span>'}</td>
+          <td>${formatDuration(check.latency_ms)}</td>
+          <td>${escapeHtml(check.parsed ?? "n/a")}</td>
+          <td class="prompt">${escapeHtml(check.error || check.output)}</td>
+        </tr>`).join("");
+      const table = checks.length ? `
+        <table>
+          <thead><tr><th>Model</th><th>Status</th><th>Time</th><th>Parsed</th><th>Receipt</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>` : "";
+      return `
+        <details open>
+          <summary>Model Health</summary>
+          <div class="hint">
+            ${escapeHtml(preflightNote)} - target max tokens ${escapeHtml(limits.targetMaxTokens ?? "n/a")} - rivals capped at ${escapeHtml(limits.comparisonTimeoutSeconds ?? "n/a")}s total
+          </div>
+          ${skippedNote}
+          ${table}
+        </details>`;
+    }
+
     function renderModelTiming(data) {
       const rows = (data.modelTiming || []).map(timing => `
         <tr>
@@ -2285,6 +2687,7 @@ HTML = r"""<!doctype html>
           ${renderAudit(data)}
           ${renderRerunTools(data)}
           ${note}
+          ${renderHealthChecks(data)}
           ${renderModelTiming(data)}
           ${renderTasks(data)}
           ${renderRawResults(data)}
@@ -2337,7 +2740,11 @@ HTML = r"""<!doctype html>
           buffer = buffer.slice(boundary + 2);
           if (block) {
             const event = parseStreamBlock(block);
-            if (event.eventName === "setup") {
+            if (event.eventName === "health_setup") {
+              initializeHealthProgress(event.data);
+            } else if (event.eventName === "health_complete") {
+              updateHealthProgress(event.data);
+            } else if (event.eventName === "setup") {
               initializeProgress(event.data);
             } else if (event.eventName === "trial_complete") {
               updateProgress(event.data);

@@ -30,10 +30,13 @@ python -m unittest -v
 - Generates one-shot letter-counting and tiny arithmetic benchmarks.
 - Computes the answer key locally.
 - Runs each model against each prompt.
+- Preflights the selected models before spending the full benchmark run.
 - Streams per-model progress while calls are in flight.
 - Parses `final answer: <integer>`.
 - Produces a leaderboard.
 - Reports per-model timing, including batch wall time, total API time, average task time, and slowest task.
+- Gives the target model a larger completion budget by default, while comparison models keep a tiny answer budget.
+- Caps non-target benchmark calls with a shared rival time limit, defaulting to 15 seconds total.
 - Reloads saved run logs so you can inspect old results without rerunning model calls.
 - Optionally cherry-picks the best observed task subset, reruns the target model's failed tasks, and zooms the chart axis until the desired conclusion emerges.
 - Uses `good_models.txt` as a blocklist when `Weenie model pile-on` is enabled, so strong models do not accidentally join the weenie pool.

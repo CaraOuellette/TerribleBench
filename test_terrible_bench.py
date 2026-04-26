@@ -1,4 +1,6 @@
 import os
+import random
+import time
 import unittest
 
 import terrible_bench
@@ -61,10 +63,135 @@ class TerribleBenchTests(unittest.TestCase):
             progress_callback=events.append,
         )
         self.assertEqual(result["mode"], "demo")
-        self.assertEqual(events[0]["type"], "setup")
+        self.assertEqual(events[0]["type"], "health_setup")
+        setup_events = [event for event in events if event["type"] == "setup"]
+        self.assertEqual(len(setup_events), 1)
         trial_events = [event for event in events if event["type"] == "trial_complete"]
         self.assertEqual(len(trial_events), 4)
+        health_events = [event for event in events if event["type"] == "health_complete"]
+        self.assertEqual(len(health_events), 2)
         self.assertIn("finished_offset_ms", trial_events[0]["result"])
+
+    def test_preflight_filters_failed_comparison_models(self) -> None:
+        original = terrible_bench.run_model_health_check
+
+        def fake_health(model, api_key, demo_mode, temperature, timeout_seconds):
+            return terrible_bench.ModelHealthCheck(
+                model=model,
+                ok=model != "bad/rival",
+                output="final answer: 1" if model != "bad/rival" else "",
+                parsed=1 if model != "bad/rival" else None,
+                expected=1,
+                latency_ms=5,
+                error=None if model != "bad/rival" else "model unavailable",
+            )
+
+        terrible_bench.run_model_health_check = fake_health
+        try:
+            result = run_benchmark(
+                {
+                    "targetModel": "my/demo-model",
+                    "comparisonModels": "bad/rival\ntiny/free-model",
+                    "taskCount": 1,
+                    "seed": 37,
+                    "demoMode": True,
+                    "parallel": True,
+                    "includeWeenies": False,
+                }
+            )
+        finally:
+            terrible_bench.run_model_health_check = original
+
+        self.assertNotIn("bad/rival", result["models"])
+        self.assertIn("bad/rival", result["preflight"]["skippedComparisonModels"])
+        self.assertTrue(all(item["model"] != "bad/rival" for item in result["results"]))
+
+    def test_preflight_target_failure_aborts(self) -> None:
+        original = terrible_bench.run_model_health_check
+
+        def fake_health(model, api_key, demo_mode, temperature, timeout_seconds):
+            return terrible_bench.ModelHealthCheck(
+                model=model,
+                ok=False,
+                output="",
+                parsed=None,
+                expected=1,
+                latency_ms=5,
+                error="target unavailable",
+            )
+
+        terrible_bench.run_model_health_check = fake_health
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Target model failed preflight"):
+                run_benchmark(
+                    {
+                        "targetModel": "my/demo-model",
+                        "comparisonModels": "tiny/free-model",
+                        "taskCount": 1,
+                        "seed": 41,
+                        "demoMode": True,
+                        "includeWeenies": False,
+                    }
+                )
+        finally:
+            terrible_bench.run_model_health_check = original
+
+    def test_target_uses_larger_token_budget_than_rivals(self) -> None:
+        original = terrible_bench.call_openrouter
+        calls = []
+
+        def fake_call(api_key, model, prompt, temperature, timeout_seconds, max_tokens=32):
+            calls.append(
+                {
+                    "model": model,
+                    "timeout_seconds": timeout_seconds,
+                    "max_tokens": max_tokens,
+                }
+            )
+            return "final answer: 0"
+
+        terrible_bench.call_openrouter = fake_call
+        try:
+            result = run_benchmark(
+                {
+                    "targetModel": "my/target",
+                    "comparisonModels": "tiny/rival",
+                    "apiKey": "sk-test",
+                    "taskCount": 1,
+                    "seed": 43,
+                    "demoMode": False,
+                    "parallel": False,
+                    "includeWeenies": False,
+                    "preflightModels": False,
+                    "targetMaxTokens": 1500,
+                    "comparisonTimeoutSeconds": 15,
+                }
+            )
+        finally:
+            terrible_bench.call_openrouter = original
+
+        by_model = {call["model"]: call for call in calls}
+        self.assertEqual(by_model["my/target"]["max_tokens"], 1500)
+        self.assertEqual(by_model["tiny/rival"]["max_tokens"], terrible_bench.DEFAULT_COMPLETION_TOKENS)
+        self.assertEqual(result["runtimeLimits"]["targetMaxTokens"], 1500)
+
+    def test_non_target_deadline_can_skip_trial(self) -> None:
+        task = build_task(random.Random(51), 0)
+        result = terrible_bench.run_trial(
+            model="tiny/rival",
+            task=task,
+            api_key="sk-test",
+            target_model="my/target",
+            seed=51,
+            demo_mode=False,
+            temperature=0,
+            timeout_seconds=30,
+            target_max_tokens=1200,
+            comparison_deadline=time.perf_counter() - 1,
+            run_started_at=time.perf_counter(),
+        )
+        self.assertFalse(result.correct)
+        self.assertIn("time limit elapsed", result.error or "")
 
     def test_p_hack_never_adds_bonus_points(self) -> None:
         result = run_benchmark(
